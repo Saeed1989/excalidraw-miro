@@ -120,6 +120,7 @@ import {
   getHoveredElementForBinding,
   isBindingEnabled,
   updateBoundElements,
+  rerouteElbowArrowsPassing,
   LinearElementEditor,
   newElementWith,
   newFrameElement,
@@ -307,6 +308,7 @@ import {
   actionBringToFront,
   actionCopy,
   actionCopyAsPng,
+  actionCopyAsPngTransparent,
   actionCopyAsSvg,
   copyText,
   actionCopyStyles,
@@ -449,6 +451,7 @@ import ConvertElementTypePopup, {
 
 import { activeConfirmDialogAtom } from "./ActiveConfirmDialog";
 import { AppArrowText } from "./App.arrowText";
+import { AppConnectionHandles } from "./App.connectionHandles";
 import { AppBucketFill } from "./App.bucketFill";
 import { AppToolDrag, TOOL_DRAG_PREVIEW_OPACITY } from "./App.toolDrag";
 import { AppCursor } from "./App.cursor";
@@ -721,6 +724,9 @@ class App extends React.Component<AppProps, AppState> {
   public flowchart: AppFlowchart = new AppFlowchart(this);
   public cursor: AppCursor = new AppCursor(this);
   public arrowText: AppArrowText = new AppArrowText(this);
+  public connectionHandles: AppConnectionHandles = new AppConnectionHandles(
+    this,
+  );
   public pan: AppPan = new AppPan(this, {
     getPointerCount: () => gesture.pointers.size,
   });
@@ -7819,6 +7825,18 @@ class App extends React.Component<AppProps, AppState> {
         : null;
       this.scene.insertElementsAtIndex(chunk, insertionIndex);
     }
+
+    // pasted, duplicated and library elements arrive fully sized, so any
+    // elbow arrow they landed on top of has to find its way around them.
+    // A shape drawn by hand is inserted zero-sized and is handled on pointer
+    // up instead, once it has a size worth routing around.
+    rerouteElbowArrowsPassing(
+      elements.filter(
+        (element) =>
+          isBindableElement(element) && element.width > 0 && element.height > 0,
+      ) as NonDeletedExcalidrawElement[],
+      this.scene,
+    );
   };
 
   public insertNewElement = (element: ExcalidrawElement) => {
@@ -8286,6 +8304,9 @@ class App extends React.Component<AppProps, AppState> {
     const hoveredArrowTextAnchor =
       this.arrowText.updateHoveredAnchor(scenePointer);
 
+    const hoveredConnectionHandle =
+      this.connectionHandles.updateHovered(scenePointer);
+
     if (
       !this.handleIframeLikeElementHover({
         hitElement,
@@ -8319,6 +8340,11 @@ class App extends React.Component<AppProps, AppState> {
             ? CURSOR_TYPE.TEXT
             : CURSOR_TYPE.CROSSHAIR,
         );
+      } else if (hoveredConnectionHandle) {
+        // connection handles take priority over the shape body (and over the
+        // selection bounding box they sit just outside of), so that a drag
+        // from one always starts an arrow rather than moving the shape
+        this.cursor.set(CURSOR_TYPE.CROSSHAIR);
       } else if (
         !event[KEYS.CTRL_OR_CMD] &&
         this.isHittingCommonBoundingBoxOfSelectedElements(
@@ -8830,7 +8856,21 @@ class App extends React.Component<AppProps, AppState> {
 
     this.clearSelectionIfNotUsingSelection();
 
-    if (this.handleSelectionOnPointerDown(event, pointerDownState)) {
+    // Connection handles outrank everything the selection tool would otherwise
+    // do here — including the shape body they sit just outside of — so that a
+    // press on one always begins pulling an arrow out of that side.
+    const connectionHandle = this.connectionHandles.getHandleAtPosition(
+      pointerDownState.origin.x,
+      pointerDownState.origin.y,
+    );
+
+    if (connectionHandle) {
+      pointerDownState.hit.connectionHandle = true;
+      this.connectionHandles.startDrag(
+        connectionHandle,
+        pointerDownState.origin,
+      );
+    } else if (this.handleSelectionOnPointerDown(event, pointerDownState)) {
       return;
     }
 
@@ -8846,7 +8886,10 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
-    if (this.state.activeTool.type === "lasso") {
+    if (pointerDownState.hit.connectionHandle) {
+      // the gesture is a connection drag — the arrow was created on pointer
+      // down above, and the pointer-move handler stretches it from here
+    } else if (this.state.activeTool.type === "lasso") {
       const hitSelectedElement =
         pointerDownState.hit.element &&
         this.isASelectedElement(pointerDownState.hit.element);
@@ -9294,6 +9337,7 @@ class App extends React.Component<AppProps, AppState> {
         wasAddedToSelection: false,
         hasBeenDuplicated: false,
         arrowLabel: false,
+        connectionHandle: false,
         hasHitCommonBoundingBoxOfSelectedElements:
           this.isHittingCommonBoundingBoxOfSelectedElements(
             origin,
@@ -10652,6 +10696,14 @@ class App extends React.Component<AppProps, AppState> {
       }
       const pointerCoords = viewportCoordsToSceneCoords(event, this.state);
 
+      // a connection drag owns the whole gesture: stretch the arrow toward the
+      // pointer (snapping to a target shape's handle) and do nothing else
+      if (pointerDownState.hit.connectionHandle) {
+        pointerDownState.drag.hasOccurred = true;
+        this.connectionHandles.updateDrag(pointerCoords);
+        return;
+      }
+
       if (this.state.activeLockedId) {
         this.setState({
           activeLockedId: null,
@@ -11593,6 +11645,49 @@ class App extends React.Component<AppProps, AppState> {
         pointerDownState.eventListeners.onMove.flush();
       }
 
+      // A connection drag owns the whole gesture, so it finishes it too: bind
+      // the end (or leave it free, over empty space) and capture the arrow's
+      // creation, both bindings and its final geometry as a SINGLE history
+      // entry — nothing in between was captured.
+      if (pointerDownState.hit.connectionHandle) {
+        const arrow = this.state.newElement;
+
+        this.connectionHandles.finalizeDrag();
+
+        // a press without a drag leaves a zero-length arrow behind
+        const isDegenerate =
+          !arrow ||
+          (isLinearElement(arrow) &&
+            pointDistance(
+              pointFrom(arrow.points[0][0], arrow.points[0][1]),
+              pointFrom(
+                arrow.points[arrow.points.length - 1][0],
+                arrow.points[arrow.points.length - 1][1],
+              ),
+            ) <
+              DRAGGING_THRESHOLD / this.state.zoom.value);
+
+        if (isDegenerate && arrow) {
+          this.scene.mutateElement(arrow as ExcalidrawElement, {
+            isDeleted: true,
+          });
+        }
+
+        this.setState({
+          newElement: null,
+          selectedLinearElement: null,
+          cursorButton: "up",
+          selectedElementIds:
+            isDegenerate || !arrow
+              ? this.state.selectedElementIds
+              : makeNextSelectedElementIds({ [arrow.id]: true }, this.state),
+        });
+
+        this.store.scheduleCapture();
+
+        return;
+      }
+
       // an armed bucket fill commits only on a GENUINE pointer up. The
       // missing-pointer-up cleanup replays this handler with the pointer
       // DOWN event (e.g. when a second finger lands mid-press — pinch/pan
@@ -12118,6 +12213,12 @@ class App extends React.Component<AppProps, AppState> {
             isDragging: false,
           },
         );
+        // A shape is inserted at pointer down, when it is still zero-sized,
+        // so this is the first moment an elbow arrow could know whether it
+        // now has to go around it.
+        if (isBindableElement(newElement)) {
+          rerouteElbowArrowsPassing(newElement, this.scene);
+        }
         // the above does not guarantee the scene to be rendered again, hence the trigger below
         this.scene.triggerUpdate();
       }
@@ -13875,7 +13976,7 @@ class App extends React.Component<AppProps, AppState> {
   ): ContextMenuItems => {
     const options: ContextMenuItems = [];
 
-    options.push(actionCopyAsPng, actionCopyAsSvg);
+    options.push(actionCopyAsPng, actionCopyAsPngTransparent, actionCopyAsSvg);
 
     // canvas contextMenu
     // -------------------------------------------------------------------------
@@ -13895,6 +13996,7 @@ class App extends React.Component<AppProps, AppState> {
         actionPaste,
         CONTEXT_MENU_SEPARATOR,
         actionCopyAsPng,
+        actionCopyAsPngTransparent,
         actionCopyAsSvg,
         copyText,
         CONTEXT_MENU_SEPARATOR,
